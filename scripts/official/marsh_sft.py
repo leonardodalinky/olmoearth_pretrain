@@ -462,6 +462,7 @@ def build_model(common: CommonComponents, model: str = "base") -> MarshModel:
         max_patch_size=MAX_PATCH_SIZE,
         drop_path=0.1,
         max_sequence_length=12,
+        use_linear_patch_embed=False,
     )
     encoder = encoder_config.build()
     return MarshModel(marsh_image_size=MARSH_IMAGE_SIZE, encoder=encoder)
