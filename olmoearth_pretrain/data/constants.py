@@ -206,6 +206,21 @@ class Modality:
         ignore_when_parsing=False,
     )
 
+    # NOTE(kelin): marsh dataset
+    MARSH = ModalitySpec(
+        name="marsh",
+        tile_resolution_factor=1,  # not used
+        # band_sets=[BandSet(["R", "G", "B", "IR"], 1)],
+        band_sets=[
+            BandSet(
+                ["B02", "B03", "B04", "B08"], 16
+            ),  # following S2 L2A, but they are actually BGR-IR, instead of RGB-IR
+        ],
+        is_multitemporal=False,
+        ignore_when_parsing=False,
+        image_tile_size_factor=1,  # The marsh dataset is stored in 1024x1024 tiles
+    )
+
     # NAIP_10 is the NAIP data that covers the same extent as a IMAGE_TILE_SIZE x IMAGE_TILE_SIZE tile
     # at 10 m/pixel resolution but is still stored at NAIP resolution.
     NAIP_10 = ModalitySpec(

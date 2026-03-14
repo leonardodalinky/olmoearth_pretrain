@@ -90,6 +90,8 @@ class OlmoEarthSample(NamedTuple):
     landsat: ArrayTensor | None = None  # [B, H, W, T, len(LANDSAT_bands)]
     # naip with different tile resolution is currently not used in favor of naip_10.
     naip: ArrayTensor | None = None  # [B, H, W, T, len(NAIP_bands)]
+    # NOTE(kelin): marsh
+    marsh: ArrayTensor | None = None  # [B, H, W, 1, 4] (R, G, B, MISSING)
     # naip_10 is currently 4x the height/width of sentinel2_l2a.
     naip_10: ArrayTensor | None = None  # [B, H, W, T, len(NAIP_bands)]
     gse: ArrayTensor | None = None  # [B, H, W, 1, len(GSE_bands)]
@@ -367,6 +369,8 @@ class MaskedOlmoEarthSample(NamedTuple):
     landsat_mask: Tensor | None = None
     naip: Tensor | None = None
     naip_mask: Tensor | None = None
+    marsh: Tensor | None = None
+    marsh_mask: Tensor | None = None
     naip_10: Tensor | None = None
     naip_10_mask: Tensor | None = None
     gse: Tensor | None = None
@@ -507,6 +511,8 @@ class TokensAndMasks(NamedTuple):
     naip_mask: Tensor | None = None
     naip_10: Tensor | None = None
     naip_10_mask: Tensor | None = None
+    marsh: Tensor | None = None
+    marsh_mask: Tensor | None = None
     gse: Tensor | None = None
     gse_mask: Tensor | None = None
     cdl: Tensor | None = None
