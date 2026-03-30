@@ -311,15 +311,17 @@ class MarshModel(nn.Module):
     def predict_image(
         self,
         image: Image,
-        slide_window_size: int = 32,
+        predict_mode: str = "resize",
+        slide_window_stride: int = 32,
         transform: Transform | None = None,
         patch_size: int = MAX_PATCH_SIZE,
     ) -> torch.Tensor:
         """Predict per-pixel classes from an image.
 
         Args:
-            img: PIL Image to predict on (H, W, C) with C=4 channels (R, G, B, IR)
-            slide_window_size: Step size for sliding window (in pixels)
+            image: PIL image to predict on.
+            predict_mode: Prediction mode. One of {"resize", "slide"}.
+            slide_window_stride: Step size for sliding-window mode (in pixels).
             transform: Optional transform to apply to the sample
             patch_size: Patch size for the encoder
 
@@ -329,44 +331,66 @@ class MarshModel(nn.Module):
         import numpy as np
         import torch.nn.functional as F
 
+        from olmoearth_pretrain.data.constants import MISSING_VALUE, Modality
+        from olmoearth_pretrain.data.normalize import Normalizer, Strategy
+        from olmoearth_pretrain.datatypes import MaskedOlmoEarthSample, OlmoEarthSample
+        from olmoearth_pretrain.data.marsh_dataset import collate_marsh_batched
+
+        device = next(self.parameters()).device
+        normalizer_computed = Normalizer(Strategy.COMPUTED)
+
+        def _build_masked_sample(tile: np.ndarray) -> MaskedOlmoEarthSample:
+            h, w, c = tile.shape
+            if c == 3:
+                ir = np.full((h, w, 1), MISSING_VALUE, dtype=tile.dtype)
+                tile = np.concatenate([tile, ir], axis=2)
+            elif c != 4:
+                raise ValueError(f"Expected 3 or 4 channels, got {c} channels.")
+
+            tile = tile.astype(np.float32)
+
+            # normalize (use NAIP stats — marsh shares the same bands)
+            missing_mask = tile == MISSING_VALUE
+            tile = normalizer_computed.normalize(Modality.NAIP, tile)
+            tile = np.where(missing_mask, 0, tile)
+
+            marsh_data = tile.astype(np.float32)
+            marsh_data = np.expand_dims(marsh_data, axis=2)  # (H, W, 1, 4)
+            timestamps = np.array([[1, 0, 2023]], dtype=np.int64)
+            sample = OlmoEarthSample(
+                marsh=marsh_data,
+                timestamps=timestamps,
+            )
+            dummy_labels = np.zeros((IMAGE_TILE_SIZE, IMAGE_TILE_SIZE), dtype=np.int64)
+            masked_sample = collate_marsh_batched(
+                [
+                    (
+                        patch_size,
+                        sample,
+                        dummy_labels,
+                    )
+                ],
+                transform=transform,
+            )[1]
+            return masked_sample
+
         # Convert PIL Image to numpy array
         img_array = np.array(image)  # (H, W, C)
         orig_h, orig_w = img_array.shape[:2]
 
-        # Case 1: Image smaller than IMAGE_TILE_SIZE (256x256)
-        if orig_h < IMAGE_TILE_SIZE or orig_w < IMAGE_TILE_SIZE:
-            # Resize to IMAGE_TILE_SIZE
-            img_resized = image.resize((IMAGE_TILE_SIZE, IMAGE_TILE_SIZE), Image.BILINEAR)
-            img_array_resized = np.array(img_resized)  # (256, 256, C)
-
-            # Prepare sample: (H, W, T, C) -> (1, H, W, T, C) for batch
-            img_tensor = torch.from_numpy(img_array_resized).float()
-            img_tensor = img_tensor.unsqueeze(0).unsqueeze(3)  # (1, H, W, 1, C)
-
-            # Create MaskedOlmoEarthSample
-            from olmoearth_pretrain.datatypes import OlmoEarthSample
-
-            sample = OlmoEarthSample(marsh=img_tensor)
-
-            # Apply transform if provided
-            if transform is not None:
-                sample = transform.apply(sample)
-
-            # Create masked sample
-            masked_sample = MaskedOlmoEarthSample(
-                marsh=sample.marsh,
-                marsh_mask=None,
+        if predict_mode not in {"resize", "slide"}:
+            raise ValueError(
+                f"Invalid predict_mode={predict_mode!r}, expected 'resize' or 'slide'."
             )
 
-            # Move to device
-            device = next(self.parameters()).device
-            masked_sample = masked_sample.to_device(device)
+        if predict_mode == "resize":
+            img_resized = image.resize((IMAGE_TILE_SIZE, IMAGE_TILE_SIZE), Image.BILINEAR)
+            img_array_resized = np.array(img_resized)  # (256, 256, C)
+            masked_sample = _build_masked_sample(img_array_resized).to_device(device)
 
-            # Predict
             logits = self(masked_sample, patch_size)  # (1, n_classes, 256, 256)
             preds = torch.argmax(logits, dim=1).squeeze(0)  # (256, 256)
 
-            # Resize back to original size
             preds_resized = (
                 F.interpolate(
                     preds.unsqueeze(0).unsqueeze(0).float(),
@@ -376,20 +400,20 @@ class MarshModel(nn.Module):
                 .squeeze()
                 .long()
             )
-
             return preds_resized
 
-        # Case 2: Image larger than or equal to IMAGE_TILE_SIZE
-        # Use sliding window with probability averaging
+        if slide_window_stride <= 0:
+            raise ValueError(
+                f"slide_window_stride must be > 0 for slide mode, got {slide_window_stride}."
+            )
 
         # Initialize probability accumulator and count map
-        device = next(self.parameters()).device
         prob_sum = torch.zeros((self.n_classes, orig_h, orig_w), device=device, dtype=torch.float32)
         count_map = torch.zeros((orig_h, orig_w), device=device, dtype=torch.float32)
 
         # Sliding window iteration
-        for y in range(0, orig_h, slide_window_size):
-            for x in range(0, orig_w, slide_window_size):
+        for y in range(0, orig_h, slide_window_stride):
+            for x in range(0, orig_w, slide_window_stride):
                 # Calculate window boundaries
                 y_end = min(y + IMAGE_TILE_SIZE, orig_h)
                 x_end = min(x + IMAGE_TILE_SIZE, orig_w)
@@ -407,27 +431,7 @@ class MarshModel(nn.Module):
                     padded[:window_h, :window_w] = window
                     window = padded
 
-                # Prepare sample
-                window_tensor = torch.from_numpy(window).float()
-                window_tensor = window_tensor.unsqueeze(0).unsqueeze(3)  # (1, H, W, 1, C)
-
-                # Create OlmoEarthSample
-                from olmoearth_pretrain.datatypes import OlmoEarthSample
-
-                sample = OlmoEarthSample(marsh=window_tensor)
-
-                # Apply transform if provided
-                if transform is not None:
-                    sample = transform.apply(sample)
-
-                # Create masked sample
-                masked_sample = MaskedOlmoEarthSample(
-                    marsh=sample.marsh,
-                    marsh_mask=None,
-                )
-
-                # Move to device
-                masked_sample = masked_sample.to_device(device)
+                masked_sample = _build_masked_sample(window).to_device(device)
 
                 # Predict
                 logits = self(masked_sample, patch_size)  # (1, n_classes, 256, 256)
